@@ -1,0 +1,130 @@
+name: Build unsigned IPA (端到端测试 H5 外壳)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: xcodebuild -> unsigned .ipa (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-15, macos-14 ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      # ---------- H5 资源自检 ----------
+      # 资源已由本地 sync_h5.ps1 同步进 H5E2E/WebApp（排除 *.bak/*.orig/_selfcheck/tools，
+      # 与 Android 构建脚本 run_build.cmd 的排除规则一致）。这里只做校验，不改内容。
+      - name: Verify H5 assets
+        run: |
+          set -euo pipefail
+          DST="H5E2E/WebApp"
+          test -d "$DST" || { echo "::error::找不到 $DST，请先用 h5toipa.py 生成工程"; exit 1; }
+
+          echo "--- 关键文件 ---"
+          for f in index.html shuiming.html login.html shouye.html nashui_edit.html xiangqing.html \
+                   js/local_api.js js/ui_kit.js js/ui_editor.js js/sdtab.js css/sdtheme.css; do
+            if [ -f "$DST/$f" ]; then
+              printf '  OK   %-24s %8s B\n' "$f" "$(wc -c < "$DST/$f" | tr -d ' ')"
+            else
+              echo "::error::缺 $f"; exit 1
+            fi
+          done
+
+          echo "--- 资源统计 ---"
+          printf '  html : %s 个\n' "$(find "$DST" -name '*.html' | wc -l | tr -d ' ')"
+          printf '  js   : %s 个\n' "$(find "$DST" -name '*.js' | wc -l | tr -d ' ')"
+          printf '  css  : %s 个\n' "$(find "$DST" -name '*.css' | wc -l | tr -d ' ')"
+          printf '  png  : %s 个\n' "$(find "$DST" -name '*.png' | wc -l | tr -d ' ')"
+          printf '  jpg  : %s 个\n' "$(find "$DST" -name '*.jpg' | wc -l | tr -d ' ')"
+          printf '  合计 : %s 个文件, %s\n' \
+            "$(find "$DST" -type f | wc -l | tr -d ' ')" "$(du -sh "$DST" | cut -f1)"
+
+          echo "--- 排除项确认（应为 0）---"
+          printf '  残留 .bak/.orig : %s\n' "$(find "$DST" \( -name '*.bak' -o -name '*.orig' \) | wc -l | tr -d ' ')"
+
+          # 关键：确认 local_api.js 的 fetch 拦截还在（"完全离线"的基础）
+
+      - name: Clean
+        run: |
+          xcodebuild -project H5E2E.xcodeproj -scheme H5E2E clean
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project H5E2E.xcodeproj \
+            -scheme H5E2E \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/H5E2E.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            archive
+
+      - name: Package .ipa (Payload folder, unsigned)
+        run: |
+          set -euo pipefail
+          ARCH="$RUNNER_TEMP/H5E2E.xcarchive/Products/Applications"
+          echo "--- archive 产物 ---"
+          ls -la "$ARCH"
+          APP=$(find "$ARCH" -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP" || { echo "::error::archive 里找不到 .app"; exit 1; }
+          echo "APP = $APP"
+
+          # 断言 H5 资源确实进包了（folder reference 有没有生效）
+          test -f "$APP/WebApp/index.html" || { echo "::error::WebApp 没有进包（folder reference 失效）"; exit 1; }
+          printf '包内 WebApp 文件数: %s\n' "$(find "$APP/WebApp" -type f | wc -l | tr -d ' ')"
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+
+          APPNAME=$(basename "$APP")
+          echo "--- 未签名校验 ---"
+          ls "$RUNNER_TEMP/ipa/Payload/$APPNAME/_CodeSignature" 2>/dev/null \
+            && echo "::warning::存在 _CodeSignature" \
+            || echo "OK: 无 _CodeSignature（未签名）"
+
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry h5e2e-ios-unsigned.ipa Payload
+          ls -lh h5e2e-ios-unsigned.ipa
+          echo "IPA_PATH=$RUNNER_TEMP/ipa/h5e2e-ios-unsigned.ipa" >> "$GITHUB_ENV"
+          echo "APP_NAME=$APPNAME" >> "$GITHUB_ENV"
+
+      - name: Verify ipa
+        run: |
+          set -euo pipefail
+          unzip -l "$IPA_PATH" | head -20
+          unzip -p "$IPA_PATH" "Payload/$APP_NAME/Info.plist" > /tmp/plist.bin
+          plutil -p /tmp/plist.bin | head -40
+          BID=$(plutil -extract CFBundleIdentifier raw /tmp/plist.bin)
+          NAME=$(plutil -extract CFBundleDisplayName raw /tmp/plist.bin)
+          MIN=$(plutil -extract MinimumOSVersion raw /tmp/plist.bin)
+          echo "### Bundle ID: \`$BID\`  名称: \`$NAME\`  最低系统: \`$MIN\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 包内 WebApp 文件数: \`$(unzip -l "$IPA_PATH" | grep -c 'Payload/.*/WebApp/')\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: h5e2e-ios-unsigned-${{ matrix.os }}
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 30
